@@ -1,0 +1,6 @@
+## Dependinte pentru voice assistant
+## ESP-SR: WakeNet + MultiNet + AFE
+## led_strip: driver pentru LED RGB on-board (WS2812 pe GPIO48)
+dependencies:
+  espressif/esp-sr: "~2.1.5"
+  espressif/led_strip: "^3.0.0"

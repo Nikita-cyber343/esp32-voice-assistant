@@ -1,0 +1,28 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "state.c"
+        "web.c"
+        "buzzer.c"
+        "ssd1306.c"
+        "oled_ui.c"
+        "dht11.c"
+        "audio_out.c"
+        "tts.c"
+        "cloud.c"
+    INCLUDE_DIRS "."
+    REQUIRES
+        driver
+        esp_driver_i2s
+        esp_driver_i2c
+        log
+        esp-sr
+        esp_timer
+        esp_wifi
+        nvs_flash
+        esp_event
+        esp_netif
+        esp_http_server
+        spiffs
+        esp_http_client
+)
