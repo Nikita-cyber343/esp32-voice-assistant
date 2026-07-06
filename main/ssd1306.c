@@ -1,0 +1,343 @@
+/*
+ * ssd1306.c - driver SSD1306 OLED 128x64 prin I2C
+ *
+ * Foloseste API-ul I2C master nou (driver/i2c_master.h) din ESP-IDF 5.x.
+ * Framebuffer 128 x 64 / 8 = 1024 bytes in DRAM.
+ */
+#include <string.h>
+#include "driver/i2c_master.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "ssd1306.h"
+
+#define SSD1306_ADDR 0x3C /* adresa standard - cele mai multe placi */
+#define SSD1306_I2C_FREQ 400000
+
+#define FB_SIZE (SSD1306_W * SSD1306_H / 8)
+
+static const char *TAG = "OLED";
+
+static i2c_master_bus_handle_t s_bus = NULL;
+static i2c_master_dev_handle_t s_dev = NULL;
+static uint8_t s_framebuf[FB_SIZE];
+
+/* ----------------------------------------------------------------------------
+ * Font 6x8 ASCII - 95 caractere de la space (32) la ~ (126)
+ * Fiecare caracter = 6 bytes; fiecare byte = 8 pixeli verticali (LSB sus).
+ * (Adaptat din font Adafruit GFX 5x7 - cea mai folosita lib pe ESP/Arduino)
+ * -------------------------------------------------------------------------- */
+static const uint8_t FONT_6x8[][6] = {
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, // ' '
+    {0x00, 0x00, 0x5F, 0x00, 0x00, 0x00}, // '!'
+    {0x00, 0x07, 0x00, 0x07, 0x00, 0x00}, // '"'
+    {0x14, 0x7F, 0x14, 0x7F, 0x14, 0x00}, // '#'
+    {0x24, 0x2A, 0x7F, 0x2A, 0x12, 0x00}, // '$'
+    {0x23, 0x13, 0x08, 0x64, 0x62, 0x00}, // '%'
+    {0x36, 0x49, 0x55, 0x22, 0x50, 0x00}, // '&'
+    {0x00, 0x05, 0x03, 0x00, 0x00, 0x00}, // '''
+    {0x00, 0x1C, 0x22, 0x41, 0x00, 0x00}, // '('
+    {0x00, 0x41, 0x22, 0x1C, 0x00, 0x00}, // ')'
+    {0x14, 0x08, 0x3E, 0x08, 0x14, 0x00}, // '*'
+    {0x08, 0x08, 0x3E, 0x08, 0x08, 0x00}, // '+'
+    {0x00, 0x50, 0x30, 0x00, 0x00, 0x00}, // ','
+    {0x08, 0x08, 0x08, 0x08, 0x08, 0x00}, // '-'
+    {0x00, 0x60, 0x60, 0x00, 0x00, 0x00}, // '.'
+    {0x20, 0x10, 0x08, 0x04, 0x02, 0x00}, // '/'
+    {0x3E, 0x51, 0x49, 0x45, 0x3E, 0x00}, // '0'
+    {0x00, 0x42, 0x7F, 0x40, 0x00, 0x00}, // '1'
+    {0x42, 0x61, 0x51, 0x49, 0x46, 0x00}, // '2'
+    {0x21, 0x41, 0x45, 0x4B, 0x31, 0x00}, // '3'
+    {0x18, 0x14, 0x12, 0x7F, 0x10, 0x00}, // '4'
+    {0x27, 0x45, 0x45, 0x45, 0x39, 0x00}, // '5'
+    {0x3C, 0x4A, 0x49, 0x49, 0x30, 0x00}, // '6'
+    {0x01, 0x71, 0x09, 0x05, 0x03, 0x00}, // '7'
+    {0x36, 0x49, 0x49, 0x49, 0x36, 0x00}, // '8'
+    {0x06, 0x49, 0x49, 0x29, 0x1E, 0x00}, // '9'
+    {0x00, 0x36, 0x36, 0x00, 0x00, 0x00}, // ':'
+    {0x00, 0x56, 0x36, 0x00, 0x00, 0x00}, // ';'
+    {0x08, 0x14, 0x22, 0x41, 0x00, 0x00}, // '<'
+    {0x14, 0x14, 0x14, 0x14, 0x14, 0x00}, // '='
+    {0x00, 0x41, 0x22, 0x14, 0x08, 0x00}, // '>'
+    {0x02, 0x01, 0x51, 0x09, 0x06, 0x00}, // '?'
+    {0x32, 0x49, 0x79, 0x41, 0x3E, 0x00}, // '@'
+    {0x7E, 0x11, 0x11, 0x11, 0x7E, 0x00}, // 'A'
+    {0x7F, 0x49, 0x49, 0x49, 0x36, 0x00}, // 'B'
+    {0x3E, 0x41, 0x41, 0x41, 0x22, 0x00}, // 'C'
+    {0x7F, 0x41, 0x41, 0x22, 0x1C, 0x00}, // 'D'
+    {0x7F, 0x49, 0x49, 0x49, 0x41, 0x00}, // 'E'
+    {0x7F, 0x09, 0x09, 0x09, 0x01, 0x00}, // 'F'
+    {0x3E, 0x41, 0x49, 0x49, 0x7A, 0x00}, // 'G'
+    {0x7F, 0x08, 0x08, 0x08, 0x7F, 0x00}, // 'H'
+    {0x00, 0x41, 0x7F, 0x41, 0x00, 0x00}, // 'I'
+    {0x20, 0x40, 0x41, 0x3F, 0x01, 0x00}, // 'J'
+    {0x7F, 0x08, 0x14, 0x22, 0x41, 0x00}, // 'K'
+    {0x7F, 0x40, 0x40, 0x40, 0x40, 0x00}, // 'L'
+    {0x7F, 0x02, 0x0C, 0x02, 0x7F, 0x00}, // 'M'
+    {0x7F, 0x04, 0x08, 0x10, 0x7F, 0x00}, // 'N'
+    {0x3E, 0x41, 0x41, 0x41, 0x3E, 0x00}, // 'O'
+    {0x7F, 0x09, 0x09, 0x09, 0x06, 0x00}, // 'P'
+    {0x3E, 0x41, 0x51, 0x21, 0x5E, 0x00}, // 'Q'
+    {0x7F, 0x09, 0x19, 0x29, 0x46, 0x00}, // 'R'
+    {0x46, 0x49, 0x49, 0x49, 0x31, 0x00}, // 'S'
+    {0x01, 0x01, 0x7F, 0x01, 0x01, 0x00}, // 'T'
+    {0x3F, 0x40, 0x40, 0x40, 0x3F, 0x00}, // 'U'
+    {0x1F, 0x20, 0x40, 0x20, 0x1F, 0x00}, // 'V'
+    {0x7F, 0x20, 0x18, 0x20, 0x7F, 0x00}, // 'W'
+    {0x63, 0x14, 0x08, 0x14, 0x63, 0x00}, // 'X'
+    {0x03, 0x04, 0x78, 0x04, 0x03, 0x00}, // 'Y'
+    {0x61, 0x51, 0x49, 0x45, 0x43, 0x00}, // 'Z'
+    {0x00, 0x7F, 0x41, 0x41, 0x00, 0x00}, // '['
+    {0x02, 0x04, 0x08, 0x10, 0x20, 0x00}, // '\'
+    {0x00, 0x41, 0x41, 0x7F, 0x00, 0x00}, // ']'
+    {0x04, 0x02, 0x01, 0x02, 0x04, 0x00}, // '^'
+    {0x40, 0x40, 0x40, 0x40, 0x40, 0x00}, // '_'
+    {0x00, 0x01, 0x02, 0x04, 0x00, 0x00}, // '`'
+    {0x20, 0x54, 0x54, 0x54, 0x78, 0x00}, // 'a'
+    {0x7F, 0x48, 0x44, 0x44, 0x38, 0x00}, // 'b'
+    {0x38, 0x44, 0x44, 0x44, 0x20, 0x00}, // 'c'
+    {0x38, 0x44, 0x44, 0x48, 0x7F, 0x00}, // 'd'
+    {0x38, 0x54, 0x54, 0x54, 0x18, 0x00}, // 'e'
+    {0x08, 0x7E, 0x09, 0x01, 0x02, 0x00}, // 'f'
+    {0x0C, 0x52, 0x52, 0x52, 0x3E, 0x00}, // 'g'
+    {0x7F, 0x08, 0x04, 0x04, 0x78, 0x00}, // 'h'
+    {0x00, 0x44, 0x7D, 0x40, 0x00, 0x00}, // 'i'
+    {0x20, 0x40, 0x44, 0x3D, 0x00, 0x00}, // 'j'
+    {0x7F, 0x10, 0x28, 0x44, 0x00, 0x00}, // 'k'
+    {0x00, 0x41, 0x7F, 0x40, 0x00, 0x00}, // 'l'
+    {0x7C, 0x04, 0x18, 0x04, 0x78, 0x00}, // 'm'
+    {0x7C, 0x08, 0x04, 0x04, 0x78, 0x00}, // 'n'
+    {0x38, 0x44, 0x44, 0x44, 0x38, 0x00}, // 'o'
+    {0x7C, 0x14, 0x14, 0x14, 0x08, 0x00}, // 'p'
+    {0x08, 0x14, 0x14, 0x18, 0x7C, 0x00}, // 'q'
+    {0x7C, 0x08, 0x04, 0x04, 0x08, 0x00}, // 'r'
+    {0x48, 0x54, 0x54, 0x54, 0x20, 0x00}, // 's'
+    {0x04, 0x3F, 0x44, 0x40, 0x20, 0x00}, // 't'
+    {0x3C, 0x40, 0x40, 0x20, 0x7C, 0x00}, // 'u'
+    {0x1C, 0x20, 0x40, 0x20, 0x1C, 0x00}, // 'v'
+    {0x3C, 0x40, 0x30, 0x40, 0x3C, 0x00}, // 'w'
+    {0x44, 0x28, 0x10, 0x28, 0x44, 0x00}, // 'x'
+    {0x0C, 0x50, 0x50, 0x50, 0x3C, 0x00}, // 'y'
+    {0x44, 0x64, 0x54, 0x4C, 0x44, 0x00}, // 'z'
+    {0x00, 0x08, 0x36, 0x41, 0x00, 0x00}, // '{'
+    {0x00, 0x00, 0x7F, 0x00, 0x00, 0x00}, // '|'
+    {0x00, 0x41, 0x36, 0x08, 0x00, 0x00}, // '}'
+    {0x02, 0x01, 0x02, 0x04, 0x02, 0x00}, // '~'
+};
+
+/* ----------------------------------------------------------------------------
+ * I2C transmit helpers
+ * -------------------------------------------------------------------------- */
+static esp_err_t i2c_cmd(uint8_t cmd)
+{
+    uint8_t buf[2] = {0x00, cmd}; /* 0x00 = control byte pentru comanda */
+    return i2c_master_transmit(s_dev, buf, 2, 100);
+}
+
+static esp_err_t i2c_data(const uint8_t *data, size_t len)
+{
+    /* Construim un buffer cu prefixul 0x40 (control byte pentru data) */
+    static uint8_t buf[1025]; /* max framebuffer + 1 byte control */
+    buf[0] = 0x40;
+    memcpy(buf + 1, data, len);
+    return i2c_master_transmit(s_dev, buf, len + 1, 200);
+}
+
+/* ----------------------------------------------------------------------------
+ * Init
+ * -------------------------------------------------------------------------- */
+bool ssd1306_init(int gpio_sda, int gpio_scl)
+{
+    i2c_master_bus_config_t bus_cfg = {
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .i2c_port = -1, /* auto-select port */
+        .sda_io_num = gpio_sda,
+        .scl_io_num = gpio_scl,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
+    };
+    if (i2c_new_master_bus(&bus_cfg, &s_bus) != ESP_OK)
+    {
+        ESP_LOGE(TAG, "i2c bus init failed");
+        return false;
+    }
+
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = SSD1306_ADDR,
+        .scl_speed_hz = SSD1306_I2C_FREQ,
+    };
+    if (i2c_master_bus_add_device(s_bus, &dev_cfg, &s_dev) != ESP_OK)
+    {
+        ESP_LOGE(TAG, "i2c add device failed");
+        return false;
+    }
+
+    /* Probe - testam daca raspunde */
+    if (i2c_master_probe(s_bus, SSD1306_ADDR, 100) != ESP_OK)
+    {
+        ESP_LOGW(TAG, "SSD1306 nu raspunde pe adresa 0x%02X. Verifica cablaj!", SSD1306_ADDR);
+        return false;
+    }
+    ESP_LOGI(TAG, "SSD1306 detectat pe SDA=GPIO%d SCL=GPIO%d", gpio_sda, gpio_scl);
+
+    /* Secventa de initializare standard SSD1306 128x64 */
+    static const uint8_t init_seq[] = {
+        0xAE, /* display off */
+        0xD5,
+        0x80, /* set display clock div */
+        0xA8,
+        0x3F, /* set multiplex (1/64) */
+        0xD3,
+        0x00, /* display offset 0 */
+        0x40, /* start line 0 */
+        0x8D,
+        0x14, /* charge pump on */
+        0x20,
+        0x00, /* memory mode: horizontal addressing */
+        0xA1, /* segment remap (mirror horizontal) */
+        0xC8, /* com scan dec (mirror vertical) */
+        0xDA,
+        0x12, /* COM pins hw config */
+        0x81,
+        0x7F, /* contrast */
+        0xD9,
+        0xF1, /* precharge */
+        0xDB,
+        0x40, /* vcomh */
+        0xA4, /* output follows RAM */
+        0xA6, /* normal display (not inverted) */
+        0xAF, /* display ON */
+    };
+    for (size_t i = 0; i < sizeof(init_seq); i++)
+    {
+        i2c_cmd(init_seq[i]);
+    }
+
+    ssd1306_clear();
+    ssd1306_refresh();
+    return true;
+}
+
+/* ----------------------------------------------------------------------------
+ * Drawing
+ * -------------------------------------------------------------------------- */
+void ssd1306_clear(void)
+{
+    memset(s_framebuf, 0, FB_SIZE);
+}
+
+void ssd1306_refresh(void)
+{
+    /* Setam window-ul de scriere la tot ecranul */
+    i2c_cmd(0x21);
+    i2c_cmd(0x00);
+    i2c_cmd(0x7F); /* col 0..127 */
+    i2c_cmd(0x22);
+    i2c_cmd(0x00);
+    i2c_cmd(0x07); /* page 0..7 */
+    /* Trimitem framebuffer-ul */
+    i2c_data(s_framebuf, FB_SIZE);
+}
+
+void ssd1306_set_pixel(int x, int y, bool on)
+{
+    if (x < 0 || x >= SSD1306_W || y < 0 || y >= SSD1306_H)
+        return;
+    int idx = x + (y / 8) * SSD1306_W;
+    uint8_t mask = 1 << (y & 7);
+    if (on)
+        s_framebuf[idx] |= mask;
+    else
+        s_framebuf[idx] &= ~mask;
+}
+
+void ssd1306_draw_char(int x, int y, char c)
+{
+    if (c < 32 || c > 126)
+        c = '?';
+    const uint8_t *glyph = FONT_6x8[c - 32];
+    for (int col = 0; col < 6; col++)
+    {
+        uint8_t bits = glyph[col];
+        for (int row = 0; row < 8; row++)
+        {
+            if (bits & (1 << row))
+                ssd1306_set_pixel(x + col, y + row, true);
+        }
+    }
+}
+
+int ssd1306_draw_string(int x, int y, const char *s)
+{
+    int dx = 0;
+    while (*s)
+    {
+        ssd1306_draw_char(x + dx, y, *s);
+        dx += 6;
+        s++;
+    }
+    return dx;
+}
+
+int ssd1306_draw_string_2x(int x, int y, const char *s)
+{
+    int dx = 0;
+    while (*s)
+    {
+        char c = *s;
+        if (c < 32 || c > 126)
+            c = '?';
+        const uint8_t *glyph = FONT_6x8[c - 32];
+        for (int col = 0; col < 6; col++)
+        {
+            uint8_t bits = glyph[col];
+            for (int row = 0; row < 8; row++)
+            {
+                bool on = (bits & (1 << row)) != 0;
+                if (on)
+                {
+                    /* Desenam pixel 2x2 */
+                    ssd1306_set_pixel(x + dx + col * 2, y + row * 2, true);
+                    ssd1306_set_pixel(x + dx + col * 2 + 1, y + row * 2, true);
+                    ssd1306_set_pixel(x + dx + col * 2, y + row * 2 + 1, true);
+                    ssd1306_set_pixel(x + dx + col * 2 + 1, y + row * 2 + 1, true);
+                }
+            }
+        }
+        dx += 12;
+        s++;
+    }
+    return dx;
+}
+
+void ssd1306_hline(int x, int y, int len, bool on)
+{
+    for (int i = 0; i < len; i++)
+        ssd1306_set_pixel(x + i, y, on);
+}
+
+void ssd1306_vline(int x, int y, int len, bool on)
+{
+    for (int i = 0; i < len; i++)
+        ssd1306_set_pixel(x, y + i, on);
+}
+
+void ssd1306_draw_progress(int x, int y, int w, int h, int percent)
+{
+    if (percent < 0)
+        percent = 0;
+    if (percent > 100)
+        percent = 100;
+    /* Border */
+    ssd1306_hline(x, y, w, true);
+    ssd1306_hline(x, y + h - 1, w, true);
+    ssd1306_vline(x, y, h, true);
+    ssd1306_vline(x + w - 1, y, h, true);
+    /* Fill */
+    int fill = ((w - 4) * percent) / 100;
+    for (int xx = 0; xx < fill; xx++)
+        for (int yy = 0; yy < h - 4; yy++)
+            ssd1306_set_pixel(x + 2 + xx, y + 2 + yy, true);
+}
